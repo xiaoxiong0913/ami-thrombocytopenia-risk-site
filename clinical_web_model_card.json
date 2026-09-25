@@ -149,7 +149,7 @@
     },
     "interpretation_templates": {
       "low": "Predicted risk is below the locked deployment threshold.",
-      "high": "Predicted risk is above the locked deployment threshold."
+      "high": "Predicted risk is at or above the locked deployment threshold."
     },
     "performance": {
       "internal_auroc": 0.887,

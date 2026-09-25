@@ -9,7 +9,7 @@ Public-facing AMI thrombocytopenia risk calculator and reporting bundle.
   - `GET /api/config`
   - `GET /healthz`
   - `POST /api/predict`
-- Locked runtime model: XGBoost post-calibrated deployment bundle
+- Locked runtime model: eight-variable CatBoost model using raw probability and threshold 0.0605
 
 ## Local Run
 

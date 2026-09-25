@@ -7,8 +7,8 @@ from pathlib import PureWindowsPath
 from typing import Any
 
 import joblib
-import numpy as np
 import pandas as pd
+from catboost import CatBoostClassifier
 from flask import Flask, Response, jsonify, request
 
 
@@ -19,14 +19,6 @@ HTML_PATH = APP_DIR / "clinical_risk_comparison.html"
 
 def _bundle_path(relative_path: str) -> Path:
     return APP_DIR.joinpath(*PureWindowsPath(relative_path).parts)
-
-
-def _dense(matrix):
-    if hasattr(matrix, "toarray"):
-        return matrix.toarray()
-    if hasattr(matrix, "todense"):
-        return matrix.todense()
-    return matrix
 
 
 def _coerce_runtime_value(value: Any, feature_spec: dict[str, Any]) -> Any:
@@ -48,12 +40,9 @@ with CARD_PATH.open("r", encoding="utf-8") as fh:
     PAYLOAD = json.load(fh)
 
 RAW_FEATURE_ORDER = list(PAYLOAD["prediction_model"]["raw_feature_order"])
-SELECTED_TRANSFORMED_FEATURES = list(PAYLOAD["prediction_model"]["selected_transformed_features"])
 FEATURE_SPECS = {item["key"]: item for item in PAYLOAD["prediction_model"]["input_features"]}
 MODEL = None
 PREPROCESSOR = None
-CALIBRATOR = None
-TRANSFORMED_INDEX_MAP: dict[str, int] | None = None
 
 app = Flask(__name__)
 
@@ -82,27 +71,19 @@ def _interpretation_templates() -> tuple[str, str]:
 
 
 def _ensure_runtime_loaded() -> None:
-    global MODEL, PREPROCESSOR, CALIBRATOR, TRANSFORMED_INDEX_MAP
-    if MODEL is not None and PREPROCESSOR is not None and TRANSFORMED_INDEX_MAP is not None:
+    global MODEL, PREPROCESSOR
+    if MODEL is not None and PREPROCESSOR is not None:
         return
 
-    runtime_payload = PAYLOAD.get("runtime", {})
-    bundle_file = runtime_payload.get("bundle_file")
-    if bundle_file:
-        runtime_bundle = joblib.load(_bundle_path(bundle_file))
-        PREPROCESSOR = runtime_bundle["preprocessor"]
-        MODEL = runtime_bundle["model"]
-        CALIBRATOR = runtime_bundle.get("calibrator")
-    else:
-        PREPROCESSOR = joblib.load(_bundle_path(runtime_payload["preprocessor_file"]))
-        MODEL = joblib.load(_bundle_path(runtime_payload["model_file"]))
-        CALIBRATOR = None
-
-    if hasattr(PREPROCESSOR, "get_feature_names_out"):
-        transformed_names = [str(item) for item in PREPROCESSOR.get_feature_names_out()]
-    else:
-        transformed_names = list(RAW_FEATURE_ORDER)
-    TRANSFORMED_INDEX_MAP = {name: index for index, name in enumerate(transformed_names)}
+    runtime_payload = PAYLOAD["runtime"]
+    preprocessor = joblib.load(_bundle_path(runtime_payload["preprocessor_file"]))
+    model = joblib.load(_bundle_path(runtime_payload["model_file"]))
+    if not isinstance(model, CatBoostClassifier):
+        raise TypeError("Deployment model is not a CatBoostClassifier")
+    if list(preprocessor.feature_names_in_) != RAW_FEATURE_ORDER:
+        raise ValueError("Preprocessor feature order differs from deployment configuration")
+    PREPROCESSOR = preprocessor
+    MODEL = model
 
 
 def _prediction_frame(inputs: dict[str, Any]) -> pd.DataFrame:
@@ -113,14 +94,8 @@ def _prediction_frame(inputs: dict[str, Any]) -> pd.DataFrame:
 def _predict(inputs: dict[str, Any]) -> dict[str, Any]:
     _ensure_runtime_loaded()
     frame = _prediction_frame(inputs)
-    transformed = _dense(PREPROCESSOR.transform(frame))
-    selected_idx = [TRANSFORMED_INDEX_MAP[name] for name in SELECTED_TRANSFORMED_FEATURES if name in TRANSFORMED_INDEX_MAP]
-    model_input = transformed[:, selected_idx] if selected_idx and len(selected_idx) == len(SELECTED_TRANSFORMED_FEATURES) else transformed
-    raw_probability = float(MODEL.predict_proba(model_input)[:, 1][0])
-    risk = raw_probability
-    if CALIBRATOR is not None:
-        calibrated = CALIBRATOR.predict_proba(np.asarray(raw_probability).reshape(-1, 1))
-        risk = float(calibrated[:, 1][0])
+    transformed = PREPROCESSOR.transform(frame)
+    risk = float(MODEL.predict_proba(transformed)[0, 1])
 
     threshold = _threshold()
     low_label, high_label = _risk_labels()
@@ -186,7 +161,12 @@ def predict():
 
 @app.get("/healthz")
 def healthz():
-    return jsonify({"status": "ok", "model": PAYLOAD["prediction_model"]["name"], "runtime_loaded": MODEL is not None})
+    try:
+        _ensure_runtime_loaded()
+    except Exception:
+        app.logger.exception("Model runtime failed to load.")
+        return jsonify({"status": "unavailable"}), 503
+    return jsonify({"status": "ok", "model": type(MODEL).__name__, "runtime_loaded": True})
 
 
 if __name__ == "__main__":
